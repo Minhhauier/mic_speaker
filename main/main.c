@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -38,19 +39,21 @@
 #define I2S_DOUT_PIN    GPIO_NUM_13
 
 // ─── Cấu hình audio ──────────────────────────────────────────
-#define SAMPLE_RATE     24000
+#define SAMPLE_RATE     22050
 #define I2S_PORT        I2S_NUM_0
 #define HTTP_BUF_SIZE   (4 * 1024)
 #define MP3_BUF_SIZE    (64 * 1024)
-#define I2S_DMA_DESC_NUM 12
-#define I2S_DMA_FRAME_NUM 512
-#define I2S_WRITE_CHUNK_BYTES 256
-#define I2S_WRITE_TIMEOUT_MS 1000
-#define I2S_TIMEOUT_RESET_THRESHOLD 20
-#define I2S_TIMEOUT_WARN_THRESHOLD 5
+#define I2S_DMA_DESC_NUM 32
+#define I2S_DMA_FRAME_NUM 1023
+#define I2S_WRITE_CHUNK_BYTES 2048
+#define AUDIO_PRE_SILENCE_SAMPLES 512
+#define AUDIO_POST_SILENCE_SAMPLES 1024
 #define AUDIO_FADE_IN_SAMPLES 480
-#define AUDIO_TAIL_RAMP_SAMPLES 480
+#define AUDIO_FADE_OUT_SAMPLES 480
 #define DC_BLOCK_ALPHA_Q15 32440
+#define TTS_CACHE_NAMESPACE "tts_cache"
+#define TTS_CACHE_MAX_ENTRY_BYTES (24 * 1024)
+#define ENABLE_TTS_CACHE 0
 // 0..100 (%): giảm âm lượng loa bằng phần mềm trước khi ghi ra I2S.
 #define AUDIO_VOLUME_PERCENT 20
 
@@ -67,57 +70,171 @@ static i2s_chan_handle_t tx_channel = NULL;
 static uint8_t *mp3_data = NULL;
 static size_t   mp3_len  = 0;
 static size_t   mp3_cap  = 0;
+static bool     tts_cache_enabled = true;
 
 // ─── Forward declarations ─────────────────────────────────────
 static void play_mp3_data(const uint8_t *data, size_t len);
 static void url_encode(const char *input, char *output, size_t out_size);
-static void i2s_write_silence_ms(uint32_t ms);
+static bool ensure_mp3_capacity(size_t needed);
+static uint32_t fnv1a_32(const char *s);
+static bool tts_cache_load(const char *text);
+static void tts_cache_store(const char *text, const uint8_t *data, size_t len);
+static void i2s_write_silence_samples(size_t samples);
+
+static void i2s_write_silence_samples(size_t samples)
+{
+    int16_t zeros[256] = {0};
+    size_t left = samples;
+    while (left > 0) {
+        size_t n = left > 256 ? 256 : left;
+        size_t written = 0;
+        (void)i2s_channel_write(tx_channel, zeros, n * sizeof(int16_t), &written, portMAX_DELAY);
+        left -= n;
+    }
+}
+
+static uint32_t current_i2s_rate = SAMPLE_RATE;
+
+static void i2s_set_sample_rate(uint32_t rate) {
+    if (rate == current_i2s_rate || rate == 0) return;
+    
+    i2s_channel_disable(tx_channel);
+    
+    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate);
+    i2s_channel_reconfig_std_clock(tx_channel, &clk_cfg);
+    
+    i2s_channel_enable(tx_channel);
+    current_i2s_rate = rate;
+    
+    ESP_LOGI(TAG, "I2S rate → %d Hz", (int)rate);
+}
+
+static bool ensure_mp3_capacity(size_t needed)
+{
+    if (needed == 0) return false;
+    if (mp3_data != NULL && mp3_cap >= needed) return true;
+
+    uint8_t *tmp = realloc(mp3_data, needed);
+    if (!tmp) return false;
+
+    mp3_data = tmp;
+    mp3_cap = needed;
+    return true;
+}
+
+static uint32_t fnv1a_32(const char *s)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; s[i] != '\0'; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static bool tts_cache_load(const char *text)
+{
+    if (!ENABLE_TTS_CACHE) {
+        return false;
+    }
+
+    if (!tts_cache_enabled) {
+        return false;
+    }
+
+    nvs_handle_t h;
+    if (nvs_open(TTS_CACHE_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+
+    uint32_t hash = fnv1a_32(text);
+    char key_len[16] = {0};
+    char key_data[16] = {0};
+    snprintf(key_len, sizeof(key_len), "l_%08lx", (unsigned long)hash);
+    snprintf(key_data, sizeof(key_data), "d_%08lx", (unsigned long)hash);
+
+    uint32_t len32 = 0;
+    esp_err_t err = nvs_get_u32(h, key_len, &len32);
+    if (err != ESP_OK || len32 == 0 || len32 > TTS_CACHE_MAX_ENTRY_BYTES) {
+        nvs_close(h);
+        return false;
+    }
+
+    if (!ensure_mp3_capacity((size_t)len32)) {
+        nvs_close(h);
+        ESP_LOGE(TAG, "Không đủ RAM để đọc cache (%u bytes)", (unsigned)len32);
+        return false;
+    }
+
+    size_t blob_len = (size_t)len32;
+    err = nvs_get_blob(h, key_data, mp3_data, &blob_len);
+    nvs_close(h);
+    if (err != ESP_OK || blob_len != (size_t)len32) {
+        return false;
+    }
+
+    mp3_len = blob_len;
+    ESP_LOGI(TAG, "Cache hit: %u bytes", (unsigned)mp3_len);
+    return true;
+}
+
+static void tts_cache_store(const char *text, const uint8_t *data, size_t len)
+{
+    if (!ENABLE_TTS_CACHE) {
+        return;
+    }
+
+    if (!tts_cache_enabled) {
+        return;
+    }
+
+    if (!data || len == 0 || len > TTS_CACHE_MAX_ENTRY_BYTES) {
+        return;
+    }
+
+    nvs_handle_t h;
+    if (nvs_open(TTS_CACHE_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+
+    uint32_t hash = fnv1a_32(text);
+    char key_len[16] = {0};
+    char key_data[16] = {0};
+    snprintf(key_len, sizeof(key_len), "l_%08lx", (unsigned long)hash);
+    snprintf(key_data, sizeof(key_data), "d_%08lx", (unsigned long)hash);
+
+    esp_err_t err = nvs_set_blob(h, key_data, data, len);
+    if (err == ESP_OK) {
+        err = nvs_set_u32(h, key_len, (uint32_t)len);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Cache store OK: %u bytes", (unsigned)len);
+    } else {
+        ESP_LOGW(TAG, "Cache store fail: %s", esp_err_to_name(err));
+        if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+            tts_cache_enabled = false;
+            ESP_LOGW(TAG, "NVS đầy, tắt cache NVS để tránh lỗi lặp.");
+        }
+    }
+}
 
 static esp_err_t i2s_write_all_with_recover(const void *buf, size_t bytes)
 {
     const uint8_t *p = (const uint8_t *)buf;
     size_t left = bytes;
-    int timeout_streak = 0;
-    int timeout_warn_count = 0;
 
     while (left > 0) {
         size_t chunk = left > I2S_WRITE_CHUNK_BYTES ? I2S_WRITE_CHUNK_BYTES : left;
         size_t written = 0;
-        esp_err_t err = i2s_channel_write(tx_channel, p, chunk, &written,
-                                          pdMS_TO_TICKS(I2S_WRITE_TIMEOUT_MS));
+        esp_err_t err = i2s_channel_write(tx_channel, p, chunk, &written, portMAX_DELAY);
         if (err == ESP_OK && written > 0) {
             p += written;
             left -= written;
-            timeout_streak = 0;
-            timeout_warn_count = 0;
-            continue;
-        }
-
-        if (err == ESP_ERR_TIMEOUT) {
-            // Timeout nhưng vẫn ghi được dữ liệu -> xem như có tiến triển, không cảnh báo.
-            if (written > 0) {
-                p += written;
-                left -= written;
-                timeout_streak = 0;
-                timeout_warn_count = 0;
-                continue;
-            }
-
-            timeout_streak++;
-            timeout_warn_count++;
-            if (timeout_warn_count >= I2S_TIMEOUT_WARN_THRESHOLD) {
-                ESP_LOGW(TAG, "I2S timeout lặp: streak=%d, left=%u",
-                         timeout_streak, (unsigned)left);
-                timeout_warn_count = 0;
-            }
-            // Tránh reset channel liên tục vì sẽ tạo tiếng bụp.
-            vTaskDelay(pdMS_TO_TICKS(2));
-            if (timeout_streak >= I2S_TIMEOUT_RESET_THRESHOLD) {
-                ESP_LOGW(TAG, "I2S bị nghẽn lâu, reset channel 1 lần để hồi phục");
-                i2s_channel_disable(tx_channel);
-                i2s_channel_enable(tx_channel);
-                timeout_streak = 0;
-            }
             continue;
         }
 
@@ -127,20 +244,6 @@ static esp_err_t i2s_write_all_with_recover(const void *buf, size_t bytes)
     }
 
     return ESP_OK;
-}
-
-static void i2s_write_silence_ms(uint32_t ms)
-{
-    int16_t zero[512] = {0};
-    uint32_t frames = (SAMPLE_RATE * ms) / 1000;
-    uint32_t samples_total = frames * 2; // stereo
-    size_t bytes_left = (size_t)samples_total * sizeof(int16_t);
-
-    while (bytes_left > 0) {
-        size_t bytes = bytes_left > sizeof(zero) ? sizeof(zero) : bytes_left;
-        (void)i2s_write_all_with_recover(zero, bytes);
-        bytes_left -= bytes;
-    }
 }
 
 // =============================================================
@@ -216,8 +319,8 @@ static void i2s_init(void)
 
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                      I2S_SLOT_MODE_STEREO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                        I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = I2S_BCLK_PIN,
@@ -246,7 +349,17 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
         if (!evt->data || evt->data_len <= 0) return ESP_OK;
 
         if (mp3_len + (size_t)evt->data_len > mp3_cap) {
-            size_t new_cap = mp3_cap + HTTP_BUF_SIZE * 8;
+            size_t needed = mp3_len + (size_t)evt->data_len;
+            size_t new_cap = (mp3_cap > 0) ? mp3_cap : (HTTP_BUF_SIZE * 2);
+            while (new_cap < needed) {
+                size_t next = new_cap + HTTP_BUF_SIZE;
+                if (next <= new_cap) {
+                    ESP_LOGE(TAG, "Tràn kích thước buffer MP3!");
+                    return ESP_FAIL;
+                }
+                new_cap = next;
+            }
+
             uint8_t *tmp = realloc(mp3_data, new_cap);
             if (!tmp) {
                 ESP_LOGE(TAG, "Hết RAM! (cần %d bytes)", (int)new_cap);
@@ -301,8 +414,10 @@ static void play_mp3_data(const uint8_t *data, size_t len)
     }
     mp3dec_init(dec);
 
-    // Đệm im lặng ngắn trước khi phát để giảm pop đầu câu.
-    i2s_write_silence_ms(20);
+    // Đệm im lặng ngắn trước câu để tránh pop ở điểm bắt đầu.
+    i2s_write_silence_samples(AUDIO_PRE_SILENCE_SAMPLES);
+
+    // Tạm tắt silence đầu câu để tránh chèn thêm write khi TX đang nghẽn.
 
     // minimp3 trả về số sample PCM (interleaved nếu stereo), tối đa 2304 sample/frame.
     static int16_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
@@ -311,12 +426,11 @@ static void play_mp3_data(const uint8_t *data, size_t len)
     const uint8_t *ptr       = data;
     size_t         remaining = len;
     int            frame_count = 0;
+    int            no_sync_count = 0;
     size_t         played_samples = 0;
-    int16_t        tail_l = 0;
-    int16_t        tail_r = 0;
     int32_t        dc_x_l = 0, dc_y_l = 0;
     int32_t        dc_x_r = 0, dc_y_r = 0;
-
+    
     while (remaining > 0) {
         memset(&info, 0, sizeof(info));
         int samples = mp3dec_decode_frame(dec, ptr, (int)remaining, pcm, &info);
@@ -324,12 +438,21 @@ static void play_mp3_data(const uint8_t *data, size_t len)
         if (info.frame_bytes == 0) {
             ptr++;
             remaining--;
+            no_sync_count++;
+            // if ((no_sync_count & 0x3FF) == 0) {
+            //     taskYIELD();
+            // }
             continue;
         }
+
+        no_sync_count = 0;
 
         if ((size_t)info.frame_bytes > remaining) {
             ESP_LOGW(TAG, "Frame lỗi: frame_bytes=%d > remaining=%u", info.frame_bytes, (unsigned)remaining);
             break;
+        }
+        if (info.hz > 0) {
+           i2s_set_sample_rate((uint32_t)info.hz);
         }
 
         if (samples > 0) {
@@ -347,11 +470,11 @@ static void play_mp3_data(const uint8_t *data, size_t len)
                 continue;
             }
 
-            // Tránh đổi clock I2S giữa chừng vì dễ tạo tiếng bụp.
-            if (info.hz > 0 && (uint32_t)info.hz != SAMPLE_RATE) {
-                ESP_LOGW(TAG, "MP3 rate=%d khác SAMPLE_RATE=%d (bỏ qua reconfig để tránh pop)",
-                         info.hz, SAMPLE_RATE);
-            }
+            // // Tránh đổi clock I2S giữa chừng vì dễ tạo tiếng bụp.
+            // if (info.hz > 0 && (uint32_t)info.hz != SAMPLE_RATE) {
+            //     ESP_LOGW(TAG, "MP3 rate=%d khác SAMPLE_RATE=%d (bỏ qua reconfig để tránh pop)",
+            //              info.hz, SAMPLE_RATE);
+            // }
 
             size_t out_samples;
             if (info.channels == 1) {
@@ -373,6 +496,8 @@ static void play_mp3_data(const uint8_t *data, size_t len)
                 continue;
             }
 
+            const bool is_last_frame = ((size_t)info.frame_bytes == remaining);
+
             // Scale volume theo phần trăm để tránh loa quá to/gây sụt áp.
             if (AUDIO_VOLUME_PERCENT < 100) {
                 for (size_t i = 0; i < out_samples; i++) {
@@ -387,7 +512,7 @@ static void play_mp3_data(const uint8_t *data, size_t len)
             if (played_samples < AUDIO_FADE_IN_SAMPLES) {
                 for (size_t i = 0; i < out_samples && played_samples < AUDIO_FADE_IN_SAMPLES; i++, played_samples++) {
                     int32_t s = pcm[i];
-                    s = (s * (int32_t)played_samples) / (int32_t)AUDIO_FADE_IN_SAMPLES;
+                    s = (s * (int32_t)played_samples+1) / (int32_t)AUDIO_FADE_IN_SAMPLES;
                     pcm[i] = (int16_t)s;
                 }
             }
@@ -411,17 +536,30 @@ static void play_mp3_data(const uint8_t *data, size_t len)
                 pcm[i + 1] = (int16_t)y_r;
             }
 
-            if (out_samples >= 2) {
-                tail_l = pcm[out_samples - 2];
-                tail_r = pcm[out_samples - 1];
+            // Fade-out mềm ở frame cuối để hạn chế click/pop khi kết thúc.
+            if (is_last_frame && AUDIO_FADE_OUT_SAMPLES > 0) {
+                size_t fade = out_samples < AUDIO_FADE_OUT_SAMPLES ? out_samples : AUDIO_FADE_OUT_SAMPLES;
+                size_t start = out_samples - fade;
+                for (size_t i = 0; i < fade; i++) {
+                    int32_t gain_num = (int32_t)(fade - i);
+                    int32_t s = pcm[start + i];
+                    s = (s * gain_num) / (int32_t)fade;
+                    pcm[start + i] = (int16_t)s;
+                }
             }
 
             size_t pcm_bytes = out_samples * sizeof(int16_t);
             esp_err_t wr_err = i2s_write_all_with_recover(pcm, pcm_bytes);
+          //  printf("okee\n");
             if (wr_err != ESP_OK) {
                 ESP_LOGW(TAG, "Bỏ qua frame do lỗi I2S: err=%s", esp_err_to_name(wr_err));
             } else {
                 frame_count++;
+            }
+
+            if ((frame_count & 0x0F) == 0) {
+                // Nhường CPU định kỳ để tránh Task WDT khi phát file dài.
+                taskYIELD();
             }
         }
 
@@ -431,21 +569,10 @@ static void play_mp3_data(const uint8_t *data, size_t len)
 
     free(dec);
 
-    // Ramp biên độ về 0 ở cuối câu để giảm pop ở điểm dừng.
-    {
-        int16_t tail[AUDIO_TAIL_RAMP_SAMPLES];
-        size_t n = AUDIO_TAIL_RAMP_SAMPLES;
-        if (n & 1U) n--; // đảm bảo số sample chẵn (stereo interleaved)
-        for (size_t i = 0; i < n; i += 2) {
-            int32_t remain = (int32_t)(n - i);
-            tail[i]     = (int16_t)(((int32_t)tail_l * remain) / (int32_t)n);
-            tail[i + 1] = (int16_t)(((int32_t)tail_r * remain) / (int32_t)n);
-        }
-        (void)i2s_write_all_with_recover(tail, n * sizeof(int16_t));
-    }
+    // Đệm im lặng ngắn sau câu để tránh pop ở điểm kết thúc.
+    i2s_write_silence_samples(AUDIO_POST_SILENCE_SAMPLES);
 
-    // Đệm im lặng ngắn sau khi phát để giảm pop cuối câu.
-    i2s_write_silence_ms(25);
+    // Tạm tắt tail ramp/silence cuối câu để tránh kẹt TX.
     ESP_LOGI(TAG, "Phát xong! (%d frames)", frame_count);
 }
 
@@ -457,13 +584,12 @@ static void speak_vietnamese(const char *text)
     ESP_LOGI(TAG, "Phát: %s", text);
 
     mp3_len = 0;
-    if (mp3_data == NULL) {
-        mp3_cap  = MP3_BUF_SIZE;
-        mp3_data = malloc(mp3_cap);
-        if (!mp3_data) {
-            ESP_LOGE(TAG, "Không cấp được buffer MP3!");
-            return;
-        }
+
+    // Cùng câu đã từng gặp -> phát từ cache, không cần gọi mạng.
+    if (tts_cache_load(text)) {
+        play_mp3_data(mp3_data, mp3_len);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        return;
     }
 
     char encoded[512] = {0};
@@ -493,6 +619,7 @@ static void speak_vietnamese(const char *text)
 
     if (err == ESP_OK && status == 200 && mp3_len > 0) {
         play_mp3_data(mp3_data, mp3_len);
+        tts_cache_store(text, mp3_data, mp3_len);
     } else {
         ESP_LOGE(TAG, "Lỗi TTS: %s (HTTP %d)", esp_err_to_name(err), status);
     }
@@ -508,13 +635,13 @@ void test_audio_task(void *arg){
     speak_vietnamese("Xin chào!");
     vTaskDelay(pdMS_TO_TICKS(800));
 
-    speak_vietnamese("Hệ thống đã sẵn sàng.");
-    vTaskDelay(pdMS_TO_TICKS(800));
+    // speak_vietnamese("Hệ thống đã sẵn sàng.");
+    // vTaskDelay(pdMS_TO_TICKS(800));
 
-    speak_vietnamese("Chào mừng bạn ");
-    vTaskDelay(pdMS_TO_TICKS(800));
+    // speak_vietnamese("Chào mừng bạn ");
+    // vTaskDelay(pdMS_TO_TICKS(800));
 
-    speak_vietnamese("Cảm ơn bạn đã sử dụng.");
+    // speak_vietnamese("Cảm ơn bạn đã sử dụng.");
 
     free(mp3_data);
     mp3_data = NULL;
@@ -551,8 +678,10 @@ void app_main(void)
 
     wifi_init();
     i2s_init();
+
+    // Tạm thời bỏ pipeline streambuffer/task TX để ưu tiên ổn định, tránh reboot.
     vTaskDelay(pdMS_TO_TICKS(500));
-    xTaskCreate(test_audio_task, "test_audio_task", 1024*16, NULL,5, NULL);
+    xTaskCreate(test_audio_task, "test_audio_task", 1024*24, NULL,5, NULL);
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
