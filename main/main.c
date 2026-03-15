@@ -43,8 +43,8 @@
 #define I2S_PORT        I2S_NUM_0
 #define HTTP_BUF_SIZE   (4 * 1024)
 #define MP3_BUF_SIZE    (64 * 1024)
-#define I2S_DMA_DESC_NUM 32
-#define I2S_DMA_FRAME_NUM 1023
+#define I2S_DMA_DESC_NUM 8
+#define I2S_DMA_FRAME_NUM 256
 #define I2S_WRITE_CHUNK_BYTES 2048
 #define AUDIO_PRE_SILENCE_SAMPLES 512
 #define AUDIO_POST_SILENCE_SAMPLES 1024
@@ -65,6 +65,7 @@ static EventGroupHandle_t wifi_event_group;
 static int retry_count = 0;
 
 static i2s_chan_handle_t tx_channel = NULL;
+static mp3dec_t s_mp3_decoder;
 
 // Buffer MP3 tải về
 static uint8_t *mp3_data = NULL;
@@ -406,12 +407,7 @@ static void play_mp3_data(const uint8_t *data, size_t len)
         return;
     }
 
-    // Cấp phát decoder trên HEAP – tránh stack overflow
-    mp3dec_t *dec = malloc(sizeof(mp3dec_t));
-    if (!dec) {
-        ESP_LOGE(TAG, "Không đủ RAM cho decoder!");
-        return;
-    }
+    mp3dec_t *dec = &s_mp3_decoder;
     mp3dec_init(dec);
 
     // Đệm im lặng ngắn trước câu để tránh pop ở điểm bắt đầu.
@@ -567,8 +563,6 @@ static void play_mp3_data(const uint8_t *data, size_t len)
         remaining -= info.frame_bytes;
     }
 
-    free(dec);
-
     // Đệm im lặng ngắn sau câu để tránh pop ở điểm kết thúc.
     i2s_write_silence_samples(AUDIO_POST_SILENCE_SAMPLES);
 
@@ -582,6 +576,10 @@ static void play_mp3_data(const uint8_t *data, size_t len)
 static void speak_vietnamese(const char *text)
 {
     ESP_LOGI(TAG, "Phát: %s", text);
+    ESP_LOGI(TAG,
+             "Heap trước HTTP: free=%u, largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
     mp3_len = 0;
 
@@ -632,7 +630,7 @@ static void speak_vietnamese(const char *text)
 // app_main
 // =============================================================
 void test_audio_task(void *arg){
-    speak_vietnamese("Xin chào!");
+    speak_vietnamese("Xin chào! hệ thống đã sẵn sàng rất vui được gặp bạn, tôi do master Minh chế tạo.");
     vTaskDelay(pdMS_TO_TICKS(800));
 
     // speak_vietnamese("Hệ thống đã sẵn sàng.");
