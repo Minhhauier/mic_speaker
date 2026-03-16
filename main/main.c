@@ -630,7 +630,7 @@ static void speak_vietnamese(const char *text)
 // app_main
 // =============================================================
 void test_audio_task(void *arg){
-    speak_vietnamese("Xin chào! hệ thống đã sẵn sàng rất vui được gặp bạn, tôi do master Minh chế tạo.");
+    speak_vietnamese("Xin chào! hệ thống đã sẵn sàng rất vui được gặp bạn, tôi do master Minh chế tạo để nói tiếng Việt, tôi có thể nói được nhiều câu khác nhau, bạn hãy thử nói: chào buổi sáng, chúc ngủ ngon, tôi yêu bạn, cảm ơn bạn, tạm biệt nhé.");
     vTaskDelay(pdMS_TO_TICKS(800));
 
     // speak_vietnamese("Hệ thống đã sẵn sàng.");
@@ -661,7 +661,7 @@ void app_main(void)
     // };
     // brownout_hal_config(&cfg);
     esp_reset_reason_t reason = esp_reset_reason();
-    ESP_LOGW(TAG, "Reset reason: %d", (int)reason);
+    ESP_LOGW(TAG, "Reset reason: %d", (int)reason); // check reset reason at startup
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {

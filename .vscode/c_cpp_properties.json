@@ -1,0 +1,36 @@
+{
+    "configurations": [
+        {
+            "name": "ESP-IDF",
+            "compilerPath": "D:/Espressif5/tools/xtensa-esp32-elf/esp-12.2.0_20230208/xtensa-esp32-elf/bin/xtensa-esp32-elf-gcc.exe",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "D:/Espressif5/frameworks/esp-idf-v5.5/components/**",
+                "${workspaceFolder}/build/config",
+                "D:/Espressif5/frameworks/esp-idf-v5.5/components/freertos/FreeRTOS-Kernel/include",
+                "D:/Espressif5/frameworks/esp-idf-v5.5/components/esp_common/include",
+                "D:/Espressif5/frameworks/esp-idf-v5.5/components/esp_system/include",
+                "D:/Espressif5/frameworks/esp-idf-v5.5/components/log/include",
+                "D:/Espressif5/frameworks/esp-idf-v5.5/components/soc/esp32/include",
+                "D:/Espressif5/frameworks/esp-idf-v5.5/components/hal/include",
+                "D:/Espressif5/frameworks/esp-idf-v5.5/components/driver/include"
+            ],
+            "browse": {
+                "path": [
+                    "${workspaceFolder}",
+                    "D:/Espressif5/frameworks/esp-idf-v5.5/components"
+                ],
+                "limitSymbolsToIncludedHeaders": false
+            },
+            "defines": [
+                "ESP_PLATFORM",
+                "ESP32",
+                "_GNU_SOURCE"
+            ],
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "gcc-x86"
+        }
+    ],
+    "version": 4
+}

@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c"
+    SRCS "main_v2.c"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash
@@ -8,4 +8,9 @@ idf_component_register(
         esp_http_client
         driver
         minimp3
+        
+        connect_wifi
+        speaker
+        cache_manager
+        config_parameter
 )
