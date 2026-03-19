@@ -11,6 +11,7 @@
 #include "speaker.h"
 // #include "cache_manager.h"
 #include "config_parameter.h"
+#include "mpu6050.h"
 
 static const char *TAG = "main";
 
@@ -36,8 +37,9 @@ void app_main(void)
     printf("wifi đã được khởi tạo.\n");
     i2s_init();
     vTaskDelay(pdMS_TO_TICKS(1000)); 
-
+    xTaskCreate(mpu6050_task, "mpu6050_task", 1024*8, NULL, 5, NULL);
     xTaskCreate(speaker_task, "test_audio_task", 1024*24, NULL, 5, NULL);
+  
     
     while (1)
     {

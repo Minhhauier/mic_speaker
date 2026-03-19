@@ -17,6 +17,7 @@
 #include "speaker.h"
 #include "config_parameter.h"
 #include "cache_manager.h"
+#include "mpu6050.h"
 
 static const char *TAG = "speaker";
 
@@ -384,11 +385,21 @@ void speak_vietnamese(const char *text)
 
 void speaker_task(void *pvParameters)
 {
-    speak_vietnamese("Xin chào! Đây là thử nghiệm Text-to-Speech trên ESP32.");
+    //speak_vietnamese("Xin chào! Đây là thử nghiệm Text-to-Speech trên ESP32.");
 
     // Tắt task sau khi phát xong.
     while (1)
     {
+        if (accel.x > 0.7f && accel.y > -0.5f && accel.y < 0.5f) {
+            speak_vietnamese("Tôi muốn đi vệ sinh");
+        } else if (accel.x < -0.7f && accel.y > -0.5f && accel.y < 0.5f) {
+            speak_vietnamese("Tôi đói rồi");
+        }
+        else if (accel.y > 0.7f && accel.x > -0.5f && accel.x < 0.5f) {
+            speak_vietnamese("Tôi mệt quá");
+        } else if (accel.y < -0.7f && accel.x > -0.5f && accel.x < 0.5f) {
+            speak_vietnamese("Tôi khát nước");
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
     

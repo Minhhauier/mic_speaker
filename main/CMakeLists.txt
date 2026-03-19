@@ -13,4 +13,5 @@ idf_component_register(
         speaker
         cache_manager
         config_parameter
+        mpu6050
 )

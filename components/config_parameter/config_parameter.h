@@ -26,5 +26,11 @@
 #define ENABLE_TTS_CACHE 0
 // 0..100 (%): giảm âm lượng loa bằng phần mềm trước khi ghi ra I2S.
 #define AUDIO_VOLUME_PERCENT 20
+// cấu hình MPU6050
+#define I2C_MASTER_SCL_IO    22   // GPIO SCL
+#define I2C_MASTER_SDA_IO    21   // GPIO SDA
+#define I2C_MASTER_PORT      I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ   400000
+
 
 #endif

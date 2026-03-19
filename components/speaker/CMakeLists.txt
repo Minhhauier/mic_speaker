@@ -7,4 +7,5 @@ idf_component_register(SRCS "speaker.c"
                         minimp3
                         config_parameter
                         esp_wifi
-                        cache_manager)
+                        cache_manager
+                        mpu6050)
