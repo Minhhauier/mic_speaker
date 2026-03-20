@@ -4,6 +4,8 @@
 #define WIFI_SSID "ABC"
 #define WIFI_PASS "coinhe2018"
 #define WIFI_MAX_RETRY 5
+#define WIFI_POWER_SAVE_MODE WIFI_PS_MIN_MODEM
+#define WIFI_MAX_TX_POWER_QUARTER_DBM 44
 // cấu hình chân I2S
 #define I2S_BCLK_PIN GPIO_NUM_27
 #define I2S_LRC_PIN GPIO_NUM_14

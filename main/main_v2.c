@@ -12,13 +12,14 @@
 // #include "cache_manager.h"
 #include "config_parameter.h"
 #include "mpu6050.h"
+#include "mic_stt_local.h"
 
 static const char *TAG = "main";
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "Khởi động ứng dụng...");
-
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Đợi log ổn định
     esp_reset_reason_t reason = esp_reset_reason();
     ESP_LOGW(TAG, "Reset reason: %d", (int)reason); // check reset reason at startup
 
@@ -35,11 +36,11 @@ void app_main(void)
 
     wifi_init();
     printf("wifi đã được khởi tạo.\n");
-    i2s_init();
-    vTaskDelay(pdMS_TO_TICKS(1000)); 
-    xTaskCreate(mpu6050_task, "mpu6050_task", 1024*8, NULL, 5, NULL);
-    xTaskCreate(speaker_task, "test_audio_task", 1024*24, NULL, 5, NULL);
-  
+    // i2s_init();
+    // vTaskDelay(pdMS_TO_TICKS(3000)); 
+    // // xTaskCreate(mpu6050_task, "mpu6050_task", 1024*8, NULL, 5, NULL);
+    // xTaskCreate(speaker_task, "test_audio_task", 1024*24, NULL, 5, NULL);
+    // xTaskCreate(mic_task, "mic_task", 1024*16, NULL, 5, NULL);
     
     while (1)
     {

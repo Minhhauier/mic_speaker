@@ -11,6 +11,8 @@ static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 static int retry_count = 0;
+static esp_event_handler_instance_t wifi_event_instance = NULL;
+static esp_event_handler_instance_t ip_event_instance = NULL;
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                 int32_t event_id, void *event_data)
@@ -36,6 +38,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 void wifi_init(void)
 {
     wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(wifi_event_group ? ESP_OK : ESP_ERR_NO_MEM);
+
+    ESP_LOGI(TAG, "Khoi tao WiFi STA...");
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -44,9 +49,9 @@ void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                         &wifi_event_handler, NULL, NULL));
+                                                         &wifi_event_handler, NULL, &wifi_event_instance));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                         &wifi_event_handler, NULL, NULL));
+                                                         &wifi_event_handler, NULL, &ip_event_instance));
     wifi_config_t wifi_config = {
         .sta = {
             .ssid     = WIFI_SSID,
@@ -57,7 +62,11 @@ void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE)); 
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(WIFI_MAX_TX_POWER_QUARTER_DBM));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_POWER_SAVE_MODE));
+    ESP_LOGI(TAG, "WiFi power save=%d, max tx power=%d quarter-dBm",
+             WIFI_POWER_SAVE_MODE, WIFI_MAX_TX_POWER_QUARTER_DBM);
+
     EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
                                             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                             pdFALSE, pdFALSE, portMAX_DELAY);

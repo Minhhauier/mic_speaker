@@ -7,6 +7,6 @@
 void i2s_init(void);
 void speak_vietnamese(const char *text);
 void speaker_task(void *pvParameters);
-
+void response(char *text);
 
 #endif

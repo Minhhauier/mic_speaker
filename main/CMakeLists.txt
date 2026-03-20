@@ -14,4 +14,5 @@ idf_component_register(
         cache_manager
         config_parameter
         mpu6050
+        mic_stt_local
 )

@@ -1,236 +1,435 @@
-// #include <stdio.h>
-// #include <string.h>
-// #include "esp_log.h"
-// #include "esp_http_client.h"
-// #include "driver/i2s_std.h"
-// #include "freertos/FreeRTOS.h"
-// #include "freertos/task.h"
-// #include "driver/i2s_std.h"
-// #include "esp_log.h"
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "esp_log.h"
+#include "esp_websocket_client.h"
+#include "driver/i2s_std.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_heap_caps.h"
 
-// #define SERVER_URL       "http://192.168.1.100:8080/transcribe"
-// #define BOUNDARY         "----ESP32Boundary"
 
-// #define RECORD_SECONDS   3
-// #define SAMPLE_RATE      16000
-// #define TOTAL_SAMPLES    (SAMPLE_RATE * RECORD_SECONDS)
+#include "speaker.h"
+// ================= CONFIG =================
+#define WS_URL           "ws://10.183.3.28:8000/ws/transcribe"
 
-// #define RESP_BUF_SIZE    2048
-// #define SEND_CHUNK       4096
+#define SAMPLE_RATE      16000
+#define VAD_CHUNK        512
+#define VAD_THRESHOLD    800
+#define VAD_SILENCE_MS   1500
+#define VAD_SILENCE_CHUNKS (VAD_SILENCE_MS * SAMPLE_RATE / 1000 / VAD_CHUNK)
+#define VAD_PRE_ROLL     20
+#define MAX_RECORD_SEC   10
+#define MAX_SAMPLES      (SAMPLE_RATE * MAX_RECORD_SEC)
 
-// static const char *TAG = "mic_stt";
-// i2s_chan_handle_t rx_handle = NULL;
-// // ⚠️ nếu thiếu RAM → giảm RECORD_SECONDS hoặc dùng PSRAM
-// static int16_t audio_buf[TOTAL_SAMPLES];
-// static char response_buf[RESP_BUF_SIZE];
-// static int response_len = 0;
+#define SEND_CHUNK       4096
+#define RESP_BUF_SIZE    2048
 
-// void i2s_init(void)
-// {
-//     // ================= CHANNEL CONFIG =================
-//     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(
-//         I2S_NUM_0,
-//         I2S_ROLE_MASTER
-//     );
+// Event bits
+#define WS_CONNECTED_BIT   BIT0
+#define WS_RESPONSE_BIT    BIT1
 
-//     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_handle));
+static const char *TAG = "mic_stt";
 
-//     // ================= STD CONFIG =================
-//     i2s_std_config_t std_cfg = {
-//         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(16000), // 16kHz
+// ================= GLOBALS =================
+static i2s_chan_handle_t   rx_handle   = NULL;
+static esp_websocket_client_handle_t ws_client = NULL;
+static EventGroupHandle_t  ws_evt_grp  = NULL;
+static int16_t            *audio_buf   = NULL;
+static char                response_buf[RESP_BUF_SIZE];
 
-//         .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(
-//             I2S_DATA_BIT_WIDTH_32BIT,   // INMP441 xuất 24bit trong 32bit
-//             I2S_SLOT_MODE_MONO
-//         ),
+// ================= I2S INIT =================
+static void i2s_mic_init(void)
+{
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(
+        I2S_NUM_1, I2S_ROLE_MASTER
+    );
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_handle));
 
-//         .gpio_cfg = {
-//             .mclk = I2S_GPIO_UNUSED,
-//             .bclk = GPIO_NUM_33,  // SCK
-//             .ws   = GPIO_NUM_25,  // WS
-//             .dout = I2S_GPIO_UNUSED,
-//             .din  = GPIO_NUM_32,  // SD
-//             .invert_flags = {
-//                 .mclk_inv = false,
-//                 .bclk_inv = false,
-//                 .ws_inv   = false,
-//             },
-//         },
-//     };
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(
+            I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO
+        ),
+        .gpio_cfg = {
+            .mclk  = I2S_GPIO_UNUSED,
+            .bclk  = GPIO_NUM_33,
+            .ws    = GPIO_NUM_25,
+            .dout  = I2S_GPIO_UNUSED,
+            .din   = GPIO_NUM_32,
+            .invert_flags = { false, false, false },
+        },
+    };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
+    ESP_LOGI(TAG, "I2S init done");
+}
 
-//     ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle, &std_cfg));
+// ================= WEBSOCKET =================
+static void ws_event_handler(void *arg,
+                              esp_event_base_t base,
+                              int32_t event_id,
+                              void *event_data)
+{
+    esp_websocket_event_data_t *data =
+        (esp_websocket_event_data_t *)event_data;
 
-//     // ================= ENABLE =================
-//     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
+    switch (event_id) {
+        case WEBSOCKET_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "WS connected");
+            xEventGroupSetBits(ws_evt_grp, WS_CONNECTED_BIT);
+            break;
 
-//     ESP_LOGI(TAG, "I2S init done");
-// }
+        case WEBSOCKET_EVENT_DISCONNECTED:
+            ESP_LOGW(TAG, "WS disconnected, reconnecting...");
+            xEventGroupClearBits(ws_evt_grp, WS_CONNECTED_BIT);
+            break;
 
-// // ================= WAV HEADER =================
-// static void build_wav_header(uint8_t *header, int samples, int sample_rate)
-// {
-//     int byte_rate = sample_rate * 2; // 16-bit mono
-//     int data_size = samples * 2;
+        case WEBSOCKET_EVENT_DATA:
+            // Chỉ xử lý text frame (op_code 0x01)
+            if (data->op_code == 0x01 && data->data_len > 0) {
+                int copy = data->data_len < RESP_BUF_SIZE - 1
+                           ? data->data_len : RESP_BUF_SIZE - 1;
+                memcpy(response_buf, data->data_ptr, copy);
+                response_buf[copy] = '\0';
+                xEventGroupSetBits(ws_evt_grp, WS_RESPONSE_BIT);
+            }
+            break;
 
-//     memcpy(header, "RIFF", 4);
-//     *(uint32_t *)(header + 4) = 36 + data_size;
-//     memcpy(header + 8, "WAVE", 4);
+        case WEBSOCKET_EVENT_ERROR:
+            ESP_LOGE(TAG, "WS error");
+            break;
 
-//     memcpy(header + 12, "fmt ", 4);
-//     *(uint32_t *)(header + 16) = 16;
-//     *(uint16_t *)(header + 20) = 1;  // PCM
-//     *(uint16_t *)(header + 22) = 1;  // mono
-//     *(uint32_t *)(header + 24) = sample_rate;
-//     *(uint32_t *)(header + 28) = byte_rate;
-//     *(uint16_t *)(header + 32) = 2;
-//     *(uint16_t *)(header + 34) = 16;
+        default:
+            break;
+    }
+}
 
-//     memcpy(header + 36, "data", 4);
-//     *(uint32_t *)(header + 40) = data_size;
-// }
+static void ws_init(void)
+{
+    ws_evt_grp = xEventGroupCreate();
 
-// // ================= RECORD AUDIO =================
-// extern i2s_chan_handle_t rx_handle;
+    esp_websocket_client_config_t ws_cfg = {
+        .uri                  = WS_URL,
+        .reconnect_timeout_ms = 3000,
+        .network_timeout_ms   = 10000,
+    };
 
-// static void record_audio(void)
-// {
-//     int32_t raw;
-//     size_t bytes_read;
+    ws_client = esp_websocket_client_init(&ws_cfg);
+    esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY,
+                                  ws_event_handler, NULL);
+    esp_websocket_client_start(ws_client);
 
-//     for (int i = 0; i < TOTAL_SAMPLES; i++) {
+    ESP_LOGI(TAG, "Đang kết nối WebSocket...");
+    EventBits_t bits = xEventGroupWaitBits(
+        ws_evt_grp, WS_CONNECTED_BIT,
+        pdFALSE, pdTRUE,
+        pdMS_TO_TICKS(10000)
+    );
 
-//         esp_err_t ret = i2s_channel_read(
-//             rx_handle,
-//             &raw,
-//             sizeof(raw),
-//             &bytes_read,
-//             portMAX_DELAY
-//         );
+    if (bits & WS_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "WebSocket sẵn sàng");
+    } else {
+        ESP_LOGE(TAG, "Timeout kết nối WebSocket!");
+    }
+}
 
-//         if (ret != ESP_OK || bytes_read != sizeof(raw)) {
-//             i--; // đọc lại sample này
-//             continue;
-//         }
+// ================= RMS =================
+static float calc_rms(int16_t *buf, int len)
+{
+    float sum = 0;
+    for (int i = 0; i < len; i++)
+        sum += (float)buf[i] * buf[i];
+    return sqrtf(sum / len);
+}
 
-//         // Convert 32-bit → 16-bit
-//         audio_buf[i] = (int16_t)(raw >> 14); // gain nhẹ
-//     }
-// }
+static int hex_val(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
 
-// // ================= HTTP EVENT =================
-// static esp_err_t http_event_handler(esp_http_client_event_t *evt)
-// {
-//     if (evt->event_id == HTTP_EVENT_ON_DATA) {
-//         int copy_len = evt->data_len;
+static int utf8_encode(uint32_t cp, char *out)
+{
+    if (cp <= 0x7F) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp <= 0x7FF) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp <= 0xFFFF) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = '?';
+    return 1;
+}
 
-//         if (response_len + copy_len >= RESP_BUF_SIZE - 1) {
-//             copy_len = RESP_BUF_SIZE - response_len - 1;
-//         }
+// Decode JSON string escape sequences in-place: \n, \", \\ and \uXXXX.
+static void json_unescape_inplace(char *s)
+{
+    char *src = s;
+    char *dst = s;
 
-//         if (copy_len > 0) {
-//             memcpy(response_buf + response_len, evt->data, copy_len);
-//             response_len += copy_len;
-//             response_buf[response_len] = '\0';
-//         }
-//     }
-//     return ESP_OK;
-// }
+    while (*src) {
+        if (*src != '\\') {
+            *dst++ = *src++;
+            continue;
+        }
 
-// // ================= SEND TO SERVER =================
-// static void send_to_server(void)
-// {
-//     uint8_t wav_hdr[44];
-//     build_wav_header(wav_hdr, TOTAL_SAMPLES, SAMPLE_RATE);
+        src++;
+        if (*src == '\0') {
+            break;
+        }
 
-//     uint32_t audio_bytes = TOTAL_SAMPLES * sizeof(int16_t);
+        switch (*src) {
+            case '"': *dst++ = '"'; src++; break;
+            case '\\': *dst++ = '\\'; src++; break;
+            case '/': *dst++ = '/'; src++; break;
+            case 'b': *dst++ = '\b'; src++; break;
+            case 'f': *dst++ = '\f'; src++; break;
+            case 'n': *dst++ = '\n'; src++; break;
+            case 'r': *dst++ = '\r'; src++; break;
+            case 't': *dst++ = '\t'; src++; break;
+            case 'u': {
+                if (src[1] && src[2] && src[3] && src[4]) {
+                    int h1 = hex_val(src[1]);
+                    int h2 = hex_val(src[2]);
+                    int h3 = hex_val(src[3]);
+                    int h4 = hex_val(src[4]);
+                    if (h1 >= 0 && h2 >= 0 && h3 >= 0 && h4 >= 0) {
+                        uint32_t cp = (uint32_t)((h1 << 12) | (h2 << 8) | (h3 << 4) | h4);
+                        char utf8[4] = {0};
+                        int n = utf8_encode(cp, utf8);
+                        for (int i = 0; i < n; i++) {
+                            *dst++ = utf8[i];
+                        }
+                        src += 5;
+                        break;
+                    }
+                }
+                *dst++ = '?';
+                src++;
+                break;
+            }
+            default:
+                *dst++ = *src++;
+                break;
+        }
+    }
 
-//     const char *part_hdr =
-//         "--" BOUNDARY "\r\n"
-//         "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
-//         "Content-Type: audio/wav\r\n\r\n";
+    *dst = '\0';
+}
 
-//     const char *part_end =
-//         "\r\n--" BOUNDARY "--\r\n";
+// ================= VAD RECORD =================
+static int record_with_vad(void)
+{
+    static int16_t pre_roll_buf[VAD_PRE_ROLL][VAD_CHUNK];
+    int   pre_roll_idx = 0;
+    int16_t chunk[VAD_CHUNK];
+    int32_t raw;
+    size_t  bytes_read;
 
-//     int content_length =
-//         strlen(part_hdr) + 44 + audio_bytes + strlen(part_end);
+    bool voice_started = false;
+    int  silence_count = 0;
+    int  total_samples = 0;
 
-//     response_len = 0;
-//     memset(response_buf, 0, sizeof(response_buf));
+    ESP_LOGI(TAG, "Chờ giọng nói...");
 
-//     esp_http_client_config_t config = {
-//         .url = SERVER_URL,
-//         .method = HTTP_METHOD_POST,
-//         .event_handler = http_event_handler,
-//         .timeout_ms = 120000,
-//     };
+    while (1) {
+        // Đọc 1 chunk
+        for (int i = 0; i < VAD_CHUNK; i++) {
+            esp_err_t ret;
+            do {
+                ret = i2s_channel_read(rx_handle, &raw, sizeof(raw),
+                                       &bytes_read, portMAX_DELAY);
+            } while (ret != ESP_OK || bytes_read != sizeof(raw));
+            chunk[i] = (int16_t)(raw >> 14);
+        }
 
-//     esp_http_client_handle_t client = esp_http_client_init(&config);
+        float rms = calc_rms(chunk, VAD_CHUNK);
 
-//     esp_http_client_set_header(
-//         client,
-//         "Content-Type",
-//         "multipart/form-data; boundary=" BOUNDARY
-//     );
+        if (!voice_started) {
+            memcpy(pre_roll_buf[pre_roll_idx], chunk,
+                   VAD_CHUNK * sizeof(int16_t));
+            pre_roll_idx = (pre_roll_idx + 1) % VAD_PRE_ROLL;
 
-//     ESP_ERROR_CHECK(esp_http_client_open(client, content_length));
+            if (rms > VAD_THRESHOLD) {
+                ESP_LOGI(TAG, "Phát hiện giọng! RMS=%.0f", rms);
+                voice_started = true;
 
-//     // gửi header multipart
-//     esp_http_client_write(client, part_hdr, strlen(part_hdr));
+                // Nạp pre-roll vào buffer chính
+                for (int k = 0; k < VAD_PRE_ROLL; k++) {
+                    int idx = (pre_roll_idx + k) % VAD_PRE_ROLL;
+                    if (total_samples + VAD_CHUNK <= MAX_SAMPLES) {
+                        memcpy(audio_buf + total_samples,
+                               pre_roll_buf[idx],
+                               VAD_CHUNK * sizeof(int16_t));
+                        total_samples += VAD_CHUNK;
+                    }
+                }
+            }
+        } else {
+            if (total_samples + VAD_CHUNK <= MAX_SAMPLES) {
+                memcpy(audio_buf + total_samples, chunk,
+                       VAD_CHUNK * sizeof(int16_t));
+                total_samples += VAD_CHUNK;
+            } else {
+                ESP_LOGW(TAG, "Đạt giới hạn %ds, dừng ghi.", MAX_RECORD_SEC);
+                break;
+            }
 
-//     // gửi WAV header
-//     esp_http_client_write(client, (char *)wav_hdr, 44);
+            if (rms < VAD_THRESHOLD) {
+                if (++silence_count >= VAD_SILENCE_CHUNKS) {
+                    ESP_LOGI(TAG, "Im lặng %.1fs, kết thúc.",
+                             VAD_SILENCE_MS / 1000.0f);
+                    break;
+                }
+            } else {
+                silence_count = 0;
+            }
+        }
+    }
 
-//     // gửi audio theo chunk
-//     uint8_t *ptr = (uint8_t *)audio_buf;
-//     int remaining = audio_bytes;
+    ESP_LOGI(TAG, "Ghi xong: %d samples (%.1fs)",
+             total_samples, (float)total_samples / SAMPLE_RATE);
+    return total_samples;
+}
 
-//     while (remaining > 0) {
-//         int to_send = (remaining > SEND_CHUNK) ? SEND_CHUNK : remaining;
+// ================= PARSE & HIỂN THỊ =================
+static void handle_stt_result(void)
+{
+    ESP_LOGI(TAG, "Response: %s", response_buf);
 
-//         esp_http_client_write(client, (char *)ptr, to_send);
+    char *key = strstr(response_buf, "\"text\"");
+    if (!key) {
+        ESP_LOGW(TAG, "Không tìm thấy text trong response");
+        return;
+    }
 
-//         ptr += to_send;
-//         remaining -= to_send;
-//     }
+    char *p = strchr(key, ':');
+    if (!p) {
+        ESP_LOGW(TAG, "Response sai format (không có ':')");
+        return;
+    }
 
-//     // kết thúc multipart
-//     esp_http_client_write(client, part_end, strlen(part_end));
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        p++;
+    }
 
-//     esp_http_client_fetch_headers(client);
+    if (*p != '"') {
+        ESP_LOGW(TAG, "Response sai format (text không phải chuỗi)");
+        return;
+    }
 
-//     int status = esp_http_client_get_status_code(client);
+    p++;
+    char *end = strchr(p, '"');
+    if (end) *end = '\0';
 
-//     ESP_LOGI(TAG, "HTTP %d", status);
-//     ESP_LOGI(TAG, "Response: %s", response_buf);
+    json_unescape_inplace(p);
 
-//     // parse đơn giản
-//     char *p = strstr(response_buf, "\"text\":\"");
-//     if (p) {
-//         p += 8;
-//         char *end = strchr(p, '"');
-//         if (end) *end = '\0';
+    ESP_LOGI(TAG, ">>> STT: %s", p);
+    response(p);
+    // TODO: Hiển thị LCD, gửi MQTT, xử lý lệnh...
+    // lcd_print_line(0, "Nghe duoc:");
+    // lcd_print_line(1, p);
+}
 
-//         ESP_LOGI(TAG, ">>> STT: %s", p);
-//     }
+// ================= SEND QUA WEBSOCKET =================
+static void send_via_ws(int num_samples)
+{
+    // Kiểm tra kết nối
+    EventBits_t bits = xEventGroupGetBits(ws_evt_grp);
+    if (!(bits & WS_CONNECTED_BIT)) {
+        ESP_LOGW(TAG, "WS chưa kết nối, bỏ qua");
+        return;
+    }
 
-//     esp_http_client_cleanup(client);
-// }
+    // Xóa response bit cũ trước khi gửi
+    xEventGroupClearBits(ws_evt_grp, WS_RESPONSE_BIT);
 
-// // ================= MAIN =================
-// // void app_main(void)
-// // {
-// //     // i2s_init();
-// //     // wifi_init();
+    // Gửi audio theo từng chunk binary
+    uint8_t *ptr      = (uint8_t *)audio_buf;
+    int      remaining = num_samples * sizeof(int16_t);
+    int      chunk_no  = 0;
 
-// //     while (1) {
+    while (remaining > 0) {
+        int to_send = remaining > SEND_CHUNK ? SEND_CHUNK : remaining;
 
-// //         ESP_LOGI(TAG, "Recording...");
-// //         record_audio();
+        int ret = esp_websocket_client_send_bin(
+            ws_client, (char *)ptr, to_send, pdMS_TO_TICKS(5000)
+        );
 
-// //         ESP_LOGI(TAG, "Sending...");
-// //         send_to_server();
+        if (ret < 0) {
+            ESP_LOGE(TAG, "Gửi chunk %d thất bại", chunk_no);
+            return;
+        }
 
-// //         vTaskDelay(pdMS_TO_TICKS(2000));
-// //     }
-// // }
+        ptr       += to_send;
+        remaining -= to_send;
+        chunk_no++;
+    }
+
+    ESP_LOGI(TAG, "Đã gửi %d chunks, gửi END...", chunk_no);
+
+    // Gửi sentinel để server bắt đầu transcribe
+    esp_websocket_client_send_text(
+        ws_client, "END", 3, pdMS_TO_TICKS(1000)
+    );
+
+    // Chờ response tối đa 30s
+    ESP_LOGI(TAG, "Chờ kết quả STT...");
+    bits = xEventGroupWaitBits(
+        ws_evt_grp, WS_RESPONSE_BIT,
+        pdTRUE, pdTRUE,
+        pdMS_TO_TICKS(30000)
+    );
+
+    if (bits & WS_RESPONSE_BIT) {
+        handle_stt_result();
+    } else {
+        ESP_LOGW(TAG, "Timeout chờ STT response (30s)");
+    }
+}
+
+// ================= MAIN TASK =================
+void mic_task(void *pvParameters)
+{
+    // Cấp phát buffer từ PSRAM
+    audio_buf = (int16_t *)heap_caps_malloc(
+        MAX_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM
+    );
+    if (!audio_buf) {
+        ESP_LOGE(TAG, "PSRAM alloc thất bại!");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "PSRAM buffer: %d KB",
+             (int)(MAX_SAMPLES * sizeof(int16_t) / 1024));
+
+    i2s_mic_init();
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Đợi I2S ổn định
+    ws_init();  
+    while (1) {
+        int samples = record_with_vad();
+
+        if (samples > SAMPLE_RATE / 2) {
+            ESP_LOGI(TAG, "Gửi %d samples...", samples);
+            send_via_ws(samples);
+        } else {
+            ESP_LOGW(TAG, "Clip quá ngắn (%.2fs), bỏ qua.",
+                     (float)samples / SAMPLE_RATE);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+}
